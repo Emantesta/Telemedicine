@@ -1,0 +1,495 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import {AddressUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol";
+import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import {IERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import {IEntryPoint} from "@account-abstraction/contracts/interfaces/IEntryPoint.sol";
+
+interface IInsuranceVerifier {
+    function verifyCoverage(address patient, uint256 appointmentId) external view returns (bool, uint256);
+}
+
+interface IDIDVerifier {
+    function verifyDID(address user, bytes32 didHash) external view returns (bool);
+}
+
+interface IOnRampOffRamp {
+    function onRamp(address user, uint256 fiatAmount, string calldata currency) external returns (uint256);
+    function offRamp(address user, uint256 cryptoAmount, string calldata currency) external returns (uint256);
+}
+
+interface IPrescriptionManager {
+    struct Prescription {
+        uint256 prescriptionId;
+        address patientAddress;
+        address doctorAddress;
+        bytes32 medicationHash;
+        string dosageInstructions;
+        uint48 issuedTimestamp;
+        uint48 expirationTimestamp;
+        uint8 remainingRefills;
+        uint8 status;
+        uint48 lastRefillTimestamp;
+        string ipfsHash;
+    }
+    function issuePrescription(address patient, bytes32 medicationHash, string calldata dosage, uint8 refills, uint48 duration, string calldata ipfsHash) external;
+    function refillPrescription(uint256 prescriptionId) external;
+    function getPatientPrescriptions(address patient, uint256 startId, uint256 limit) external view returns (Prescription[] memory);
+}
+
+interface IDisputeManager {
+    function raiseDispute(uint256 appointmentId, string calldata reason) external;
+    function resolveDispute(uint256 disputeId, bool doctorFault, bytes32 actionHash) external returns (uint256, address, address);
+}
+
+library TelemedicineLibrary {
+    struct GamificationData {
+        uint96 mediPoints;
+        uint48 levelExpirationTimestamp;
+        uint48 lastCheckInTimestamp;
+        uint48 lastWeeklyResetTimestamp;
+        uint48 lastMonthlyResetTimestamp;
+        uint16 successfulReferrals;
+        uint8 currentLevel;
+        uint8 weeklyDataPoints;
+        uint8 weeklyCheckInPoints;
+        uint8 monthlyAppointmentCount;
+        bool leaderboardOptIn;
+    }
+
+    function awardMediPoints(GamificationData storage data, uint256 points) internal {
+        data.mediPoints += uint96(points);
+        uint8 newLevel = calculateLevel(data.mediPoints);
+        if (newLevel > data.currentLevel) {
+            data.currentLevel = newLevel;
+            if (newLevel >= 2) data.levelExpirationTimestamp = uint48(block.timestamp + (newLevel - 1) * 30 days);
+        }
+    }
+
+    function calculateLevel(uint256 points) internal pure returns (uint8) {
+        if (points > 300) return 4;
+        if (points > 150) return 3;
+        if (points > 50) return 2;
+        return 1;
+    }
+
+    function getDiscountPercentage(GamificationData storage data) internal view returns (uint256) {
+        uint8 level = data.currentLevel;
+        if (level == 4) return 30;
+        if (level == 3 && block.timestamp <= data.levelExpirationTimestamp) return 20;
+        if (level == 2 && block.timestamp <= data.levelExpirationTimestamp) return 10;
+        if (level == 1) return 5;
+        return 0;
+    }
+}
+
+contract TelemedicineSystem is Initializable, AccessControlUpgradeable, ReentrancyGuardUpgradeable, PausableUpgradeable {
+    using AddressUpgradeable for address payable;
+    using TelemedicineLibrary for TelemedicineLibrary.GamificationData;
+
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant DOCTOR_ROLE = keccak256("DOCTOR_ROLE");
+    bytes32 public constant PATIENT_ROLE = keccak256("PATIENT_ROLE");
+
+    IERC20Upgradeable public usdcToken;
+    IERC20Upgradeable public sonicToken;
+    AggregatorV3Interface public ethUsdPriceFeed;
+    AggregatorV3Interface public sonicUsdPriceFeed;
+    IInsuranceVerifier public insuranceVerifier;
+    IDIDVerifier public didVerifier;
+    IOnRampOffRamp public rampProvider;
+    IEntryPoint public entryPoint;
+    AggregatorV3Interface public marketDemandFeed;
+    IPrescriptionManager public prescriptionManager;
+    IDisputeManager public disputeManager;
+
+    uint256 private constant MAX_STRING_LENGTH = 128;
+    uint256 private constant MIN_LICENSE_LENGTH = 6;
+    uint256 private constant MAX_SPECIALTY_LENGTH = 32;
+    uint256 private constant MIN_BOOKING_BUFFER = 15 minutes;
+    uint256 private constant MIN_CANCELLATION_BUFFER = 1 hours;
+    uint256 private constant DOCTOR_VERIFICATION_TIMEOUT = 7 days;
+    uint256 private constant EMERGENCY_FEE_MULTIPLIER = 150;
+    uint256 private constant EMERGENCY_RESPONSE_TIME = 1 hours;
+
+    enum AppointmentStatus { Pending, Confirmed, Completed, Cancelled, Emergency }
+    enum PaymentType { ETH, USDC, SONIC }
+
+    struct NotificationPreferences { bool smsEnabled; bool emailEnabled; string preferredLanguage; }
+    struct Patient { bytes32 medicalHistoryHash; string encryptedSymmetricKey; address insuranceProviderAddress; string publicKey; NotificationPreferences notificationPrefs; bytes32 decentralizedIdHash; bool dataMonetizationConsent; uint256 dataRewardBalance; TelemedicineLibrary.GamificationData gamification; bool isRegistered; }
+    struct Doctor { string licenseNumber; uint256 consultationFee; string publicKey; string specialty; uint64 ratingSum; uint64 ratingCount; uint48 lastActivityTimestamp; bool isVerified; bool isActive; }
+    struct Appointment { uint48 scheduledTimestamp; address patientAddress; address doctorAddress; AppointmentStatus status; bytes32 diagnosisHash; string encryptedSymmetricKey; uint256 feeAmount; string ipfsHash; PaymentType paymentMethod; bool insuranceClaimed; uint48 bookingTimestamp; uint8 disputeStatus; bool isEmergency; }
+    struct DoctorVerificationRequest { address doctorAddress; string licenseNumber; string verificationDocumentIpfsHash; uint48 requestTimestamp; bool processed; bool approved; }
+
+    mapping(address => Patient) private patients;
+    mapping(address => mapping(address => bool)) public patientAuthorizedDoctors;
+    mapping(address => Doctor) private doctors;
+    mapping(uint256 => Appointment) public appointments;
+    mapping(address => mapping(uint256 => bool)) private availabilitySlots;
+    mapping(address => uint256) public emergencyFunds;
+    mapping(bytes32 => uint256) private timelockedActions;
+    mapping(address => uint256) public doctorVerificationRequestIds;
+    mapping(uint256 => DoctorVerificationRequest) public doctorVerificationRequests;
+
+    uint256 public appointmentCounter;
+    uint256 public verificationRequestCounter;
+    uint256 public emergencyFeePremium;
+
+    event PatientRegistered(address indexed patient);
+    event DoctorRegistered(address indexed doctor);
+    event DoctorVerificationRequested(uint256 indexed requestId, address indexed doctor);
+    event DoctorVerificationProcessed(uint256 indexed requestId, address indexed doctor, bool approved);
+    event AppointmentBooked(uint256 indexed appointmentId, address indexed patient);
+    event EmergencyAppointmentBooked(uint256 indexed appointmentId, address indexed patient);
+    event AppointmentStatusUpdated(uint256 indexed appointmentId, AppointmentStatus status);
+    event DoctorAvailabilityBatchUpdated(address indexed doctor, uint256[] timestamps, bool isAvailable);
+    event EmergencyWithdrawal(address indexed user, uint256 amount);
+    event DoctorRated(address indexed doctor, uint256 rating);
+    event MediPointsEarned(address indexed user, uint256 points);
+    event AdminActionQueued(bytes32 indexed actionHash, uint256 unlockTime);
+
+    function initialize(
+        address _usdcTokenAddress,
+        address _sonicTokenAddress,
+        address _ethUsdPriceFeedAddress,
+        address _sonicUsdPriceFeedAddress,
+        address _insuranceVerifierAddress,
+        address _didVerifierAddress,
+        address _rampProviderAddress,
+        address _entryPointAddress,
+        address _marketDemandFeedAddress,
+        address _prescriptionManagerAddress,
+        address _disputeManagerAddress
+    ) external initializer {
+        __AccessControl_init();
+        __ReentrancyGuard_init();
+        __Pausable_init();
+
+        _setRoleAdmin(ADMIN_ROLE, ADMIN_ROLE);
+        _setRoleAdmin(DOCTOR_ROLE, ADMIN_ROLE);
+        _setRoleAdmin(PATIENT_ROLE, ADMIN_ROLE);
+        _grantRole(ADMIN_ROLE, msg.sender);
+
+        usdcToken = IERC20Upgradeable(_usdcTokenAddress);
+        sonicToken = IERC20Upgradeable(_sonicTokenAddress);
+        ethUsdPriceFeed = AggregatorV3Interface(_ethUsdPriceFeedAddress);
+        sonicUsdPriceFeed = AggregatorV3Interface(_sonicUsdPriceFeedAddress);
+        insuranceVerifier = IInsuranceVerifier(_insuranceVerifierAddress);
+        didVerifier = IDIDVerifier(_didVerifierAddress);
+        rampProvider = IOnRampOffRamp(_rampProviderAddress);
+        entryPoint = IEntryPoint(_entryPointAddress);
+        marketDemandFeed = AggregatorV3Interface(_marketDemandFeedAddress);
+        prescriptionManager = IPrescriptionManager(_prescriptionManagerAddress);
+        disputeManager = IDisputeManager(_disputeManagerAddress);
+
+        emergencyFeePremium = EMERGENCY_FEE_MULTIPLIER;
+    }
+
+    function queueAdminAction(bytes32 _actionHash) external onlyRole(ADMIN_ROLE) {
+        timelockedActions[_actionHash] = block.timestamp + 1 days;
+        emit AdminActionQueued(_actionHash, block.timestamp + 1 days);
+    }
+
+    function requestDoctorVerification(string calldata _licenseNumber, string calldata _verificationDocumentIpfsHash) 
+        external whenNotPaused {
+        require(!doctors[msg.sender].isVerified, "Verified");
+        require(doctorVerificationRequestIds[msg.sender] == 0, "Pending");
+        require(bytes(_licenseNumber).length >= MIN_LICENSE_LENGTH, "Short");
+        require(bytes(_verificationDocumentIpfsHash).length <= MAX_STRING_LENGTH, "Long");
+
+        verificationRequestCounter++;
+        doctorVerificationRequestIds[msg.sender] = verificationRequestCounter;
+        doctorVerificationRequests[verificationRequestCounter] = DoctorVerificationRequest(
+            msg.sender, _licenseNumber, _verificationDocumentIpfsHash, uint48(block.timestamp), false, false
+        );
+        emit DoctorVerificationRequested(verificationRequestCounter, msg.sender);
+    }
+
+    function processDoctorVerification(
+        uint256 _requestId,
+        bool _approved,
+        uint256 _consultationFee,
+        string calldata _publicKey,
+        string calldata _specialty,
+        bytes32 _actionHash
+    ) external onlyRole(ADMIN_ROLE) whenNotPaused {
+        require(timelockedActions[_actionHash] != 0 && block.timestamp >= timelockedActions[_actionHash], "Timelock");
+        DoctorVerificationRequest storage request = doctorVerificationRequests[_requestId];
+        require(!request.processed, "Done");
+        require(block.timestamp <= request.requestTimestamp + DOCTOR_VERIFICATION_TIMEOUT, "Late");
+
+        request.processed = true;
+        request.approved = _approved;
+        address doctorAddress = request.doctorAddress;
+        delete doctorVerificationRequestIds[doctorAddress];
+
+        if (_approved) {
+            Doctor storage doctor = doctors[doctorAddress];
+            require(bytes(_publicKey).length <= MAX_STRING_LENGTH, "Key long");
+            require(bytes(_specialty).length <= MAX_SPECIALTY_LENGTH, "Spec long");
+
+            doctor.licenseNumber = request.licenseNumber;
+            doctor.consultationFee = _consultationFee;
+            doctor.publicKey = _publicKey;
+            doctor.specialty = _specialty;
+            doctor.isVerified = true;
+            doctor.isActive = true;
+            doctor.lastActivityTimestamp = uint48(block.timestamp);
+
+            _grantRole(DOCTOR_ROLE, doctorAddress);
+            emit DoctorRegistered(doctorAddress);
+        }
+        delete timelockedActions[_actionHash];
+        emit DoctorVerificationProcessed(_requestId, doctorAddress, _approved);
+    }
+
+    function registerPatient(
+        string calldata _encryptedSymmetricKey,
+        address _insuranceProviderAddress,
+        string calldata _publicKey,
+        bytes32 _decentralizedIdHash,
+        bool _smsEnabled,
+        bool _emailEnabled,
+        string calldata _preferredLanguage,
+        bool _dataMonetizationConsent
+    ) external whenNotPaused nonReentrant {
+        require(!patients[msg.sender].isRegistered, "Registered");
+        require(bytes(_encryptedSymmetricKey).length <= MAX_STRING_LENGTH, "Key long");
+        require(bytes(_publicKey).length <= MAX_STRING_LENGTH, "Pub key long");
+        require(bytes(_preferredLanguage).length <= 5, "Lang long");
+        require(didVerifier.verifyDID(msg.sender, _decentralizedIdHash), "DID fail");
+
+        Patient storage patient = patients[msg.sender];
+        patient.isRegistered = true;
+        patient.encryptedSymmetricKey = _encryptedSymmetricKey;
+        patient.insuranceProviderAddress = _insuranceProviderAddress;
+        patient.publicKey = _publicKey;
+        patient.notificationPrefs = NotificationPreferences(_smsEnabled, _emailEnabled, _preferredLanguage);
+        patient.decentralizedIdHash = _decentralizedIdHash;
+        patient.dataMonetizationConsent = _dataMonetizationConsent;
+        patient.gamification.lastWeeklyResetTimestamp = uint48(block.timestamp);
+        patient.gamification.lastMonthlyResetTimestamp = uint48(block.timestamp);
+
+        _grantRole(PATIENT_ROLE, msg.sender);
+        emit PatientRegistered(msg.sender);
+    }
+
+    function setDoctorAvailabilityBatch(uint256[] calldata _timestamps, bool[] calldata _isAvailable) 
+        external onlyRole(DOCTOR_ROLE) whenNotPaused {
+        require(_timestamps.length == _isAvailable.length, "Mismatch");
+        Doctor storage doctor = doctors[msg.sender];
+        require(doctor.isVerified, "Not verified");
+        doctor.lastActivityTimestamp = uint48(block.timestamp);
+        uint256 minBuffer = block.timestamp + MIN_BOOKING_BUFFER;
+
+        for (uint256 i; i < _timestamps.length; ++i) {
+            require(_timestamps[i] > minBuffer, "Soon");
+            availabilitySlots[msg.sender][_timestamps[i]] = _isAvailable[i];
+        }
+        emit DoctorAvailabilityBatchUpdated(msg.sender, _timestamps, _isAvailable[0]);
+    }
+
+    function bookAppointment(
+        address _doctorAddress,
+        uint256 _scheduledTimestamp,
+        PaymentType _paymentMethod,
+        bool _useInsurance,
+        address _referrer
+    ) external payable onlyRole(PATIENT_ROLE) whenNotPaused nonReentrant {
+        Doctor storage doctor = doctors[_doctorAddress];
+        require(doctor.isVerified && doctor.isActive, "Unavailable");
+        require(availabilitySlots[_doctorAddress][_scheduledTimestamp], "Taken");
+        require(_scheduledTimestamp > block.timestamp + MIN_BOOKING_BUFFER, "Soon");
+
+        uint256 finalFee = _calculateFee(_doctorAddress, msg.sender, _useInsurance);
+        _processPayment(_paymentMethod, finalFee, _doctorAddress);
+
+        appointmentCounter++;
+        Appointment storage apt = appointments[appointmentCounter];
+        apt.scheduledTimestamp = uint48(_scheduledTimestamp);
+        apt.patientAddress = msg.sender;
+        apt.doctorAddress = _doctorAddress;
+        apt.status = AppointmentStatus.Pending;
+        apt.feeAmount = finalFee;
+        apt.paymentMethod = _paymentMethod;
+        apt.insuranceClaimed = _useInsurance;
+        apt.bookingTimestamp = uint48(block.timestamp);
+        apt.disputeStatus = 0;
+
+        availabilitySlots[_doctorAddress][_scheduledTimestamp] = false;
+        patients[msg.sender].gamification.awardMediPoints(20);
+        _handleReferral(_referrer);
+        emit AppointmentBooked(appointmentCounter, msg.sender);
+    }
+
+    function bookEmergencyAppointment(
+        address _doctorAddress,
+        PaymentType _paymentMethod,
+        bool _useInsurance,
+        address _referrer
+    ) external payable onlyRole(PATIENT_ROLE) whenNotPaused nonReentrant {
+        Doctor storage doctor = doctors[_doctorAddress];
+        require(doctor.isVerified && doctor.isActive, "Unavailable");
+        require(block.timestamp + EMERGENCY_RESPONSE_TIME > block.timestamp, "Overflow");
+
+        uint256 baseFee = _calculateFee(_doctorAddress, msg.sender, _useInsurance);
+        uint256 emergencyFee = baseFee * emergencyFeePremium / 100;
+        _processPayment(_paymentMethod, emergencyFee, _doctorAddress);
+
+        appointmentCounter++;
+        Appointment storage apt = appointments[appointmentCounter];
+        apt.scheduledTimestamp = uint48(block.timestamp + EMERGENCY_RESPONSE_TIME);
+        apt.patientAddress = msg.sender;
+        apt.doctorAddress = _doctorAddress;
+        apt.status = AppointmentStatus.Emergency;
+        apt.feeAmount = emergencyFee;
+        apt.paymentMethod = _paymentMethod;
+        apt.insuranceClaimed = _useInsurance;
+        apt.bookingTimestamp = uint48(block.timestamp);
+        apt.isEmergency = true;
+        apt.disputeStatus = 0;
+
+        patients[msg.sender].gamification.awardMediPoints(30);
+        _handleReferral(_referrer);
+        emit EmergencyAppointmentBooked(appointmentCounter, msg.sender);
+    }
+
+    function cancelAppointment(uint256 _appointmentId) 
+        external onlyRole(PATIENT_ROLE) whenNotPaused nonReentrant {
+        Appointment storage apt = appointments[_appointmentId];
+        require(apt.patientAddress == msg.sender, "Not yours");
+        require(apt.status == AppointmentStatus.Pending, "Not pending");
+        require(apt.scheduledTimestamp > block.timestamp + MIN_CANCELLATION_BUFFER, "Late");
+        require(!apt.isEmergency, "Emergency");
+
+        address doctorAddress = apt.doctorAddress;
+        PaymentType paymentMethod = apt.paymentMethod;
+        uint256 feeAmount = apt.feeAmount;
+
+        apt.status = AppointmentStatus.Cancelled;
+        availabilitySlots[doctorAddress][apt.scheduledTimestamp] = true;
+        
+        _refundPayment(paymentMethod, feeAmount, msg.sender, doctorAddress);
+        emit AppointmentStatusUpdated(_appointmentId, AppointmentStatus.Cancelled);
+    }
+
+    function completeAppointment(uint256 _appointmentId) 
+        external onlyRole(DOCTOR_ROLE) whenNotPaused {
+        Appointment storage apt = appointments[_appointmentId];
+        require(apt.doctorAddress == msg.sender, "Not yours");
+        require(apt.status == AppointmentStatus.Pending || apt.status == AppointmentStatus.Emergency, "Invalid");
+        require(block.timestamp >= apt.scheduledTimestamp, "Early");
+        if (apt.isEmergency) require(block.timestamp <= apt.scheduledTimestamp + EMERGENCY_RESPONSE_TIME, "Expired");
+
+        apt.status = AppointmentStatus.Completed;
+        Patient storage patient = patients[apt.patientAddress];
+        patient.gamification.monthlyAppointmentCount++;
+        doctors[msg.sender].lastActivityTimestamp = uint48(block.timestamp);
+        patientAuthorizedDoctors[apt.patientAddress][msg.sender] = true;
+        emit AppointmentStatusUpdated(_appointmentId, AppointmentStatus.Completed);
+    }
+
+    function rateDoctor(uint256 _appointmentId, uint8 _rating) 
+        external onlyRole(PATIENT_ROLE) whenNotPaused {
+        require(_rating <= 5, "High");
+        Appointment storage apt = appointments[_appointmentId];
+        require(apt.patientAddress == msg.sender, "Not yours");
+        require(apt.status == AppointmentStatus.Completed, "Not done");
+        Doctor storage doctor = doctors[apt.doctorAddress];
+        require(doctor.ratingSum + _rating <= type(uint64).max, "Overflow");
+        require(doctor.ratingCount < type(uint64).max, "Count max");
+
+        doctor.ratingSum += _rating;
+        doctor.ratingCount++;
+        emit DoctorRated(apt.doctorAddress, _rating);
+    }
+
+    function emergencyWithdraw() external whenPaused nonReentrant {
+        uint256 amount = emergencyFunds[msg.sender];
+        require(amount > 0, "No funds");
+
+        emergencyFunds[msg.sender] = 0;
+        payable(msg.sender).transfer(amount);
+        emit EmergencyWithdrawal(msg.sender, amount);
+    }
+
+    function _calculateFee(address _doctor, address _patient, bool _useInsurance) 
+        private view returns (uint256) {
+        uint256 baseFee = doctors[_doctor].consultationFee;
+        if (baseFee == 0) return 0;
+        uint256 discount = baseFee * patients[_patient].gamification.getDiscountPercentage() / 100;
+        uint256 fee = baseFee - discount;
+
+        if (_useInsurance) {
+            (bool covered, uint256 coverage) = insuranceVerifier.verifyCoverage(_patient, appointmentCounter + 1);
+            if (covered) fee = fee > (fee * coverage / 100) ? fee - (fee * coverage / 100) : 0;
+        }
+        return fee;
+    }
+
+    function _processPayment(PaymentType _type, uint256 _amount, address _doctor) private {
+        if (_type == PaymentType.ETH) {
+            require(msg.value >= _amount, "Low ETH");
+            uint256 refund = msg.value > _amount ? msg.value - _amount : 0;
+            emergencyFunds[_doctor] += _amount;
+            if (refund > 0) {
+                payable(msg.sender).transfer(refund);
+            }
+        } else if (_type == PaymentType.USDC) {
+            require(usdcToken.allowance(msg.sender, address(this)) >= _amount, "Low USDC");
+            require(usdcToken.transferFrom(msg.sender, _doctor, _amount), "USDC fail");
+        } else {
+            require(sonicToken.allowance(msg.sender, address(this)) >= _amount, "Low SONIC");
+            require(sonicToken.transferFrom(msg.sender, _doctor, _amount), "SONIC fail");
+        }
+    }
+
+    function _refundPayment(PaymentType _type, uint256 _amount, address _patient, address _doctor) private {
+        if (_type == PaymentType.ETH) {
+            require(emergencyFunds[_doctor] >= _amount, "Low funds");
+            emergencyFunds[_doctor] -= _amount;
+            payable(_patient).transfer(_amount);
+        } else if (_type == PaymentType.USDC) {
+            require(usdcToken.transferFrom(_doctor, _patient, _amount), "USDC fail");
+        } else {
+            require(sonicToken.transferFrom(_doctor, _patient, _amount), "SONIC fail");
+        }
+    }
+
+    function _handleReferral(address _referrer) private {
+        if (_referrer != address(0) && hasRole(PATIENT_ROLE, _referrer) && _referrer != msg.sender) {
+            Patient storage referrer = patients[_referrer];
+            referrer.gamification.successfulReferrals++;
+            referrer.gamification.awardMediPoints(15);
+        }
+    }
+
+    function getPatientAppointments(address _patient, uint256 _startId, uint256 _limit) 
+        external view returns (Appointment[] memory) {
+        require(hasRole(PATIENT_ROLE, _patient), "Not patient");
+        Appointment[] memory result = new Appointment[](_limit);
+        uint256 count;
+        for (uint256 i = _startId; i <= appointmentCounter && count < _limit; ++i) {
+            if (appointments[i].patientAddress == _patient) {
+                result[count] = appointments[i];
+                count++;
+            }
+        }
+        Appointment[] memory trimmedResult = new Appointment[](count);
+        for (uint256 i = 0; i < count; i++) {
+            trimmedResult[i] = result[i];
+        }
+        return trimmedResult;
+    }
+
+    function getDoctorRating(address _doctor) external view returns (uint256) {
+        Doctor storage doctor = doctors[_doctor];
+        require(doctor.ratingCount > 0, "No ratings");
+        return doctor.ratingSum / doctor.ratingCount;
+    }
+}
