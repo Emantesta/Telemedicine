@@ -1,0 +1,8 @@
+it("should confirm an appointment and AI result", async function () {
+  await telemedicine.connect(addr1).bookAppointment(owner.address, Math.floor(Date.now() / 1000) + 3600, 0, false, ethers.constants.AddressZero, { value: ethers.utils.parseEther("1") });
+  await telemedicine.connect(owner).confirmAppointment(1);
+  await telemedicine.connect(owner).confirmAIResult(1, ethers.utils.formatBytes32String("aiResultHash"));
+  const apt = await telemedicine.appointments(1);
+  expect(apt.status).to.equal(1); // Confirmed
+  expect(apt.diagnosisHash).to.equal(ethers.utils.formatBytes32String("aiResultHash"));
+});
