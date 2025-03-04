@@ -1,0 +1,13 @@
+Smart Contract:
+Update .env with all contract addresses.
+
+npm install && npx hardhat compile && npx hardhat test
+
+Backend:
+Ensure Redis is running (redis-server).
+
+npm install && npm run dev
+
+Frontend:
+npm install && npm start
+
