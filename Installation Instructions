@@ -1,0 +1,14 @@
+// smart contract installation
+//bash
+npm install
+npx hardhat compile
+
+// Backend installation
+//bash
+npm install
+npm start
+
+// Frontend installation
+//bash
+npm install
+npm start
