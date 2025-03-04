@@ -1,0 +1,31 @@
+// ... existing imports and contract setup ...
+
+contract TelemedicineSystem is Initializable, AccessControlUpgradeable, ReentrancyGuardUpgradeable, PausableUpgradeable {
+    // ... existing code ...
+
+    // Event for AI result confirmation
+    event AIResultConfirmed(uint256 indexed appointmentId, bytes32 aiResultHash, address doctor);
+
+    // Confirm appointment by doctor
+    function confirmAppointment(uint256 _appointmentId) 
+        external onlyRole(DOCTOR_ROLE) whenNotPaused {
+        Appointment storage apt = appointments[_appointmentId];
+        require(apt.doctorAddress == msg.sender, "Not yours");
+        require(apt.status == AppointmentStatus.Pending, "Not pending");
+        apt.status = AppointmentStatus.Confirmed;
+        doctors[msg.sender].lastActivityTimestamp = uint48(block.timestamp);
+        emit AppointmentStatusUpdated(_appointmentId, AppointmentStatus.Confirmed);
+    }
+
+    // Doctor confirms AI analysis result
+    function confirmAIResult(uint256 _appointmentId, bytes32 _aiResultHash) 
+        external onlyRole(DOCTOR_ROLE) whenNotPaused {
+        Appointment storage apt = appointments[_appointmentId];
+        require(apt.doctorAddress == msg.sender, "Not yours");
+        require(apt.status == AppointmentStatus.Confirmed || apt.status == AppointmentStatus.Emergency, "Not confirmed");
+        apt.diagnosisHash = _aiResultHash;
+        emit AIResultConfirmed(_appointmentId, _aiResultHash, msg.sender);
+    }
+
+    // ... existing functions ...
+}
